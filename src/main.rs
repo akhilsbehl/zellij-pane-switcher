@@ -43,7 +43,12 @@ enum Confirmation {
 enum Operation {
     Killing,
     WaitingForDeletion(String),
-    Renaming { old_name: String, new_name: String },
+}
+
+#[derive(Clone)]
+struct PendingRename {
+    old_name: String,
+    new_name: String,
 }
 
 #[derive(Default)]
@@ -61,6 +66,7 @@ struct State {
     prompt: Option<Prompt>,
     confirmation: Option<Confirmation>,
     operation: Option<Operation>,
+    pending_rename: Option<PendingRename>,
     save_after_switch: bool,
     filtered_matches: Vec<SearchMatch>,
     selected: Option<TargetId>,
@@ -354,11 +360,21 @@ impl State {
 
     fn execute_rename_session(&mut self, session_name: String, name: String) {
         self.confirmation = None;
-        self.operation = Some(Operation::Renaming {
+        // Zellij can retain the old name in resurrectable_sessions until its
+        // next session serialisation. Remember the rename so that stale
+        // snapshots do not put the old name back into the UI.
+        self.pending_rename = Some(PendingRename {
             old_name: session_name.clone(),
             new_name: name.clone(),
         });
+        // `rename_session` is fire-and-forget. Do not wait for a follow-up
+        // snapshot here: a rename can already be applied while the session
+        // update is still queued, and blocking input during that window makes
+        // the plugin appear to hang.
         rename_session(&name);
+        self.snapshot
+            .sessions
+            .retain(|session| session.name != session_name || session.live);
         if let Some(session) = self
             .snapshot
             .sessions
@@ -374,41 +390,6 @@ impl State {
         self.rebuild_matches();
         self.normalize_selection();
         self.status = None;
-        set_timeout(0.25);
-    }
-
-    fn poll_rename(&mut self) -> bool {
-        let Some(Operation::Renaming { old_name, new_name }) = self.operation.clone() else {
-            return false;
-        };
-        self.refresh_snapshot();
-        if self
-            .snapshot
-            .sessions
-            .iter()
-            .any(|session| session.live && session.is_current && session.name == new_name)
-        {
-            self.operation = None;
-            return true;
-        }
-        if let Some(session) = self
-            .snapshot
-            .sessions
-            .iter_mut()
-            .find(|session| session.live && session.is_current && session.name == old_name)
-        {
-            session.name = new_name.clone();
-            self.snapshot
-                .sessions
-                .sort_by(|left, right| left.name.cmp(&right.name));
-            self.selected = Some(TargetId::Session {
-                session_name: new_name,
-            });
-            self.rebuild_matches();
-            self.normalize_selection();
-        }
-        set_timeout(0.25);
-        true
     }
 
     fn start_create_session(&mut self) {
@@ -482,6 +463,21 @@ impl State {
         self.status = None;
     }
 
+    fn finish_delete(&mut self, target: String) {
+        match delete_dead_session(&target) {
+            Ok(()) => {
+                self.operation = None;
+                self.refresh_snapshot();
+                self.return_to_pane_switcher();
+                self.status = None;
+            }
+            Err(error) => {
+                self.operation = None;
+                self.status = Some(format!("Could not delete session {target}: {error}"));
+            }
+        }
+    }
+
     fn execute_delete(&mut self, target: String) {
         self.confirmation = None;
         self.refresh_snapshot();
@@ -496,13 +492,14 @@ impl State {
         };
 
         if session.live {
-            if session.is_current {
+            let is_current = session.is_current;
+            if is_current {
                 if let Err(error) = save_session() {
                     self.status = Some(format!("Could not save session {target}: {error}"));
                     return;
                 }
             }
-            let safety_destination = if session.is_current {
+            let safety_destination = if is_current {
                 let Some(destination) = self.safety_destination(&target) else {
                     self.status = Some("Cannot delete the only live session".to_string());
                     return;
@@ -518,21 +515,28 @@ impl State {
                 self.status = Some(format!("Could not kill session {target}: {error}"));
                 return;
             }
-            self.operation = Some(Operation::WaitingForDeletion(target));
-            set_timeout(0.25);
+
+            // `kill_sessions` waits for the target session to acknowledge its
+            // shutdown. Delete from the same operation instead of relying on a
+            // later SessionUpdate: for the current session, that update can be
+            // delivered after the plugin has been destroyed with its host
+            // session; for a remote session, it can race cache serialization.
+            self.refresh_snapshot();
+            if self
+                .snapshot
+                .sessions
+                .iter()
+                .any(|session| session.name == target && session.live)
+            {
+                self.operation = Some(Operation::WaitingForDeletion(target));
+                set_timeout(0.25);
+            } else {
+                self.finish_delete(target);
+            }
             return;
         }
 
-        match delete_dead_session(&target) {
-            Ok(()) => {
-                self.refresh_snapshot();
-                self.return_to_pane_switcher();
-                self.status = None;
-            }
-            Err(error) => {
-                self.status = Some(format!("Could not delete session {target}: {error}"));
-            }
-        }
+        self.finish_delete(target);
     }
 
     fn complete_waiting_delete(&mut self) -> bool {
@@ -547,18 +551,7 @@ impl State {
         {
             return false;
         }
-        match delete_dead_session(&target) {
-            Ok(()) => {
-                self.operation = None;
-                self.refresh_snapshot();
-                self.return_to_pane_switcher();
-                self.status = None;
-            }
-            Err(error) => {
-                self.operation = None;
-                self.status = Some(format!("Could not delete session {target}: {error}"));
-            }
-        }
+        self.finish_delete(target);
         true
     }
 
@@ -930,12 +923,12 @@ impl State {
     fn apply_session_snapshot(
         &mut self,
         live_sessions: Vec<SessionInfo>,
-        resurrectable: Vec<(String, Duration)>,
+        mut resurrectable: Vec<(String, Duration)>,
     ) -> bool {
         let own_plugin_id = self
             .own_pane_id
             .or_else(|| Some(get_plugin_ids().plugin_id));
-        let live_sessions = live_sessions
+        let mut live_sessions = live_sessions
             .into_iter()
             .map(|session| SessionData {
                 name: session.name,
@@ -963,6 +956,50 @@ impl State {
                     .collect(),
             })
             .collect::<Vec<_>>();
+
+        if let Some(pending) = self.pending_rename.clone() {
+            let new_name_is_current = live_sessions
+                .iter()
+                .any(|session| session.is_current && session.name == pending.new_name);
+            let old_name_is_current = live_sessions
+                .iter()
+                .any(|session| session.is_current && session.name == pending.old_name);
+            let old_name_is_present = live_sessions
+                .iter()
+                .any(|session| session.name == pending.old_name)
+                || resurrectable
+                    .iter()
+                    .any(|(name, _)| name == &pending.old_name);
+
+            // A session update can arrive before the rename is reflected in
+            // the live-session entry. Keep the optimistic name in that case.
+            if !new_name_is_current && old_name_is_current {
+                for session in live_sessions
+                    .iter_mut()
+                    .filter(|session| session.is_current && session.name == pending.old_name)
+                {
+                    session.name = pending.new_name.clone();
+                }
+            }
+
+            // Once the renamed live session is present, any old-name entry is
+            // stale, whether it arrived in the live list or the resurrectable
+            // cache. Never show that duplicate.
+            if new_name_is_current {
+                live_sessions.retain(|session| session.name != pending.old_name);
+                resurrectable.retain(|(name, _)| name != &pending.old_name);
+            } else if old_name_is_current {
+                resurrectable.retain(|(name, _)| name != &pending.old_name);
+            }
+
+            // Once a snapshot contains the new live name and no old entry,
+            // resume normal snapshot handling. This also allows the old name
+            // to be used again later.
+            if new_name_is_current && !old_name_is_present {
+                self.pending_rename = None;
+            }
+        }
+
         let next_snapshot = normalize_sessions(&live_sessions, &resurrectable, own_plugin_id);
         let changed = self.snapshot != next_snapshot;
         self.snapshot = next_snapshot;
@@ -1043,7 +1080,6 @@ impl ZellijPlugin for State {
             Event::SessionUpdate(_, _) => false,
             Event::Timer(_) if self.visible => {
                 self.poll_waiting_delete();
-                self.poll_rename();
                 set_timeout(0.25);
                 true
             }

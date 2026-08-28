@@ -17,7 +17,7 @@ After a kill or delete, return to the pane switcher so the user can choose where
 - **Live session**: a session returned in `SessionInfo.live_sessions`.
 - **Resurrectable session**: a session returned in `resurrectable_sessions`; it has no live panes.
 - **Kill**: terminate a live session with `kill_sessions`. Its resurrectable cache is retained only if Zellij has already serialized the session; the plugin cannot force serialization through the available API.
-- **Delete**: permanently remove the session's resurrectable cache with `delete_dead_session`. Deleting a live session therefore means kill first, wait for it to disappear from the live list, then delete its cache.
+- **Delete**: permanently remove the session's resurrectable cache with `delete_dead_session`. For a live session, the plugin calls `kill_sessions`, verifies from a fresh snapshot that the target is no longer live, and deletes its cache in the same operation. The immediate follow-up is required because a later `SessionUpdate` can race cache serialization or arrive after the plugin is destroyed with its current session.
 - **Safety destination**: the next available live session used only when the plugin's current session is the affected session. It is selected deterministically by ascending session name, wrapping at the end, and excluding the affected session.
 
 If no other live session exists, the plugin must not kill or delete the current session. Show an error and keep the plugin open.
@@ -66,6 +66,13 @@ The confirmation must require an explicit `Enter`; `Esc` makes no host call. Ren
 5. Refresh from the next `SessionUpdate`; do not optimistically add a session.
 6. If the name already exists, do not silently select a different session. Surface Zellij's failure/status and leave the current session unchanged.
 
+### Rename
+
+1. Always target the current live session, regardless of the selected row or search query.
+2. Call `rename_session(&new_name)` once and update the visible current-session row immediately.
+3. Zellij may briefly report the old name as a resurrectable cache entry while serialising the rename. Suppress that stale entry while the renamed live session is present; do not wait for a follow-up `SessionUpdate`.
+4. Once a snapshot contains the new live name without the old entry, clear the temporary suppression so the old name can be used again later.
+
 ### Kill
 
 1. The target must be live. A resurrectable-only target is invalid for kill.
@@ -81,7 +88,7 @@ The confirmation must require an explicit `Enter`; `Esc` makes no host call. Ren
 1. The target may be live or resurrectable.
 2. If the target is current, identify a safety destination before issuing any destructive command and switch to it first. If no other live session exists, refuse the operation.
 3. For a resurrectable target, call `delete_dead_session(&target_name)` once.
-4. For a live target, call `kill_sessions(&[target_name])`, wait for a `SessionUpdate` proving the target is no longer live, then call `delete_dead_session(&target_name)`.
+4. For a live target, call `kill_sessions(&[target_name])`, verify the target is absent from a fresh live-session snapshot, then call `delete_dead_session(&target_name)` immediately.
 5. If the target is remote, do not automatically switch sessions after deletion; return to pane switcher mode and let the user choose where to jump.
 6. Never call `delete_dead_session` while the target is still live.
 7. On success, return to pane switcher mode and refresh. The target must disappear from both live and resurrectable entries.
@@ -140,7 +147,7 @@ While `Executing` or `WaitingForDeletion`, ignore lifecycle keys and render prog
 - Killing the current session switches to the next available live session before sending the kill command, then returns to pane switcher.
 - Deleting a resurrectable session removes it permanently and returns to pane switcher.
 - Deleting a remote live session performs kill → confirmed absence from live sessions → delete cache, in that order, then returns to pane switcher.
-- Deleting the current session performs switch → kill → wait → delete; with no alternative live session it is refused.
+- Deleting the current session performs switch → kill → fresh live-session check → delete; with no alternative live session it is refused.
 - `Esc` during name entry or confirmation produces no lifecycle host call.
 - Plain `n`, `k`, and `d` remain searchable; only uppercase `N`, `K`, and `D` trigger session lifecycle actions.
 - Rename and detach both require explicit confirmation; `Esc` cancels without making the host call.
