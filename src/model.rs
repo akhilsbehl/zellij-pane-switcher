@@ -200,9 +200,8 @@ pub fn normalize_sessions(
                 .collect::<Vec<_>>();
 
             for pane_data in &session.panes {
-                if pane_data.is_plugin
-                    && (excluded_current_plugin_id == Some(pane_data.pane_id)
-                        || pane_data.title.contains("zellij-pane-switcher"))
+                if excluded_current_plugin_id == Some(pane_data.pane_id)
+                    || (pane_data.is_plugin && pane_data.title.contains("zellij-pane-switcher"))
                 {
                     continue;
                 }
@@ -563,6 +562,52 @@ mod tests {
         });
         let snapshot = normalize_sessions(&[data], &[], Some(99));
         assert_eq!(filter_snapshot(&snapshot, "").len(), 1);
+    }
+
+    #[test]
+    fn current_switcher_is_excluded_when_session_snapshot_marks_it_as_a_float() {
+        let mut data = session("a", true, &[("one", &[("shell", 1)])]);
+        data.panes.extend([
+            PaneData {
+                tab_position: 0,
+                pane_id: 99,
+                is_plugin: false,
+                is_floating: true,
+                is_suppressed: false,
+                title: "(/home/akhil/warchives/zellij-pane-switcher) → file:/home/akhil/configs/zellij-pane-switcher/zellij-pane-switcher.wasm".to_string(),
+            },
+            PaneData {
+                tab_position: 0,
+                pane_id: 77,
+                is_plugin: true,
+                is_floating: false,
+                is_suppressed: false,
+                title: "configuration".to_string(),
+            },
+        ]);
+        let snapshot = normalize_sessions(&[data], &[], Some(99));
+        let targets = filter_snapshot(&snapshot, "")
+            .into_iter()
+            .map(|matched| matched.target())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            vec![
+                TargetId::Pane {
+                    session_name: "a".to_string(),
+                    tab_position: 0,
+                    pane_id: 1,
+                    is_plugin: false,
+                },
+                TargetId::Pane {
+                    session_name: "a".to_string(),
+                    tab_position: 0,
+                    pane_id: 77,
+                    is_plugin: true,
+                },
+            ],
+            "the switcher's own floating pane must be excluded without hiding other plugins"
+        );
     }
 
     #[test]
