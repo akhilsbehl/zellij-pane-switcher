@@ -201,7 +201,7 @@ pub fn normalize_sessions(
 
             for pane_data in &session.panes {
                 if excluded_current_plugin_id == Some(pane_data.pane_id)
-                    || (pane_data.is_plugin && pane_data.title.contains("zellij-pane-switcher"))
+                    || is_switcher_artifact_title(&pane_data.title)
                 {
                     continue;
                 }
@@ -348,6 +348,12 @@ pub fn filter_snapshot(snapshot: &Snapshot, query: &str) -> Vec<SearchMatch> {
 
 fn contains_case_insensitive(label: &str, query: &str) -> Option<usize> {
     label.to_lowercase().find(query)
+}
+
+fn is_switcher_artifact_title(title: &str) -> bool {
+    title.contains("file:")
+        && title.contains("zellij-pane-switcher")
+        && title.contains(".wasm")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -565,16 +571,40 @@ mod tests {
     }
 
     #[test]
-    fn current_switcher_is_excluded_when_session_snapshot_marks_it_as_a_float() {
-        let mut data = session("a", true, &[("one", &[("shell", 1)])]);
+    fn current_switcher_and_its_distinct_floating_shadow_are_excluded() {
+        let mut data = session("launchPad", true, &[("ukms", &[("shell", 1)])]);
         data.panes.extend([
             PaneData {
                 tab_position: 0,
-                pane_id: 99,
+                pane_id: 22,
+                is_plugin: true,
+                is_floating: false,
+                is_suppressed: false,
+                title: "(/home/akhil/warchives/zellij-pane-switcher) - file:/home/akhil/configs/zellij-pane-switcher/zellij-pane-switcher.wasm".to_string(),
+            },
+            PaneData {
+                tab_position: 0,
+                pane_id: 9,
                 is_plugin: false,
                 is_floating: true,
                 is_suppressed: false,
-                title: "(/home/akhil/warchives/zellij-pane-switcher) → file:/home/akhil/configs/zellij-pane-switcher/zellij-pane-switcher.wasm".to_string(),
+                title: "(/home/akhil/warchives/zellij-pane-switcher) - file:/home/akhil/configs/zellij-pane-switcher/zellij-pane-switcher.wasm [☼ Idle]".to_string(),
+            },
+            PaneData {
+                tab_position: 0,
+                pane_id: 12,
+                is_plugin: false,
+                is_floating: false,
+                is_suppressed: false,
+                title: "Pane #4".to_string(),
+            },
+            PaneData {
+                tab_position: 0,
+                pane_id: 13,
+                is_plugin: false,
+                is_floating: false,
+                is_suppressed: false,
+                title: "cargo test - zellij-pane-switcher".to_string(),
             },
             PaneData {
                 tab_position: 0,
@@ -585,7 +615,7 @@ mod tests {
                 title: "configuration".to_string(),
             },
         ]);
-        let snapshot = normalize_sessions(&[data], &[], Some(99));
+        let snapshot = normalize_sessions(&[data], &[], Some(22));
         let targets = filter_snapshot(&snapshot, "")
             .into_iter()
             .map(|matched| matched.target())
@@ -594,19 +624,31 @@ mod tests {
             targets,
             vec![
                 TargetId::Pane {
-                    session_name: "a".to_string(),
+                    session_name: "launchPad".to_string(),
                     tab_position: 0,
                     pane_id: 1,
                     is_plugin: false,
                 },
                 TargetId::Pane {
-                    session_name: "a".to_string(),
+                    session_name: "launchPad".to_string(),
+                    tab_position: 0,
+                    pane_id: 12,
+                    is_plugin: false,
+                },
+                TargetId::Pane {
+                    session_name: "launchPad".to_string(),
+                    tab_position: 0,
+                    pane_id: 13,
+                    is_plugin: false,
+                },
+                TargetId::Pane {
+                    session_name: "launchPad".to_string(),
                     tab_position: 0,
                     pane_id: 77,
                     is_plugin: true,
                 },
             ],
-            "the switcher's own floating pane must be excluded without hiding other plugins"
+            "exclude the switcher and its shadow without hiding ordinary or plugin panes"
         );
     }
 
